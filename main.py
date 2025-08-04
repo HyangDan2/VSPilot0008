@@ -1,12 +1,11 @@
 import sys, time, cv2
 import numpy as np
-from queue import Queue, Empty
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from queue import Queue, Empty, Full
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QPushButton, QWidget,
-    QVBoxLayout, QHBoxLayout, QFileDialog, QSizePolicy
+    QApplication, QMainWindow, QLabel, QFileDialog, QSizePolicy
 )
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QAction
 
 # ────────────────────────────────────────
 # Decoder Thread
@@ -21,12 +20,19 @@ class VideoDecoder(QThread):
 
     def run(self):
         cap = cv2.VideoCapture(self.path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
         while self.running and cap.isOpened():
             ret, frame = cap.read()
             if not ret:
-                break
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                cap.open(self.path)
+                ret, frame = cap.read()
+                print(f"Restart : {self.path}")
+                continue
+            
             self.frame_ready.emit(frame)
-            time.sleep(1 / 30)
+            time.sleep(1/fps)
         cap.release()
 
     def stop(self):
@@ -71,6 +77,7 @@ class MixingThread(QThread):
         result[:, ::2] = f2[:, ::2]  # even columns from f2
         return result
 
+
 # ────────────────────────────────────────
 # Main GUI
 # ────────────────────────────────────────
@@ -81,8 +88,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 720)
 
         # Queues for frames
-        self.q1 = Queue()
-        self.q2 = Queue()
+        self.q1 = Queue(maxsize=10)
+        self.q2 = Queue(maxsize=10)
 
         # UI Elements
         self.label = QLabel("🔲 Mixed Output")
@@ -90,30 +97,8 @@ class MainWindow(QMainWindow):
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self.btn1 = QPushButton("🎞 Video 1 (Odd)")
-        self.btn2 = QPushButton("🎞 Video 2 (Even)")
-        self.btn_play = QPushButton("▶ 재생")
-        self.btn_stop = QPushButton("⏹ 중지")
-
-        self.btn1.clicked.connect(self.select_video1)
-        self.btn2.clicked.connect(self.select_video2)
-        self.btn_play.clicked.connect(self.start_mixing)
-        self.btn_stop.clicked.connect(self.stop_all)
-
-        # Layout
-        top = QHBoxLayout()
-        top.addWidget(self.btn1)
-        top.addWidget(self.btn2)
-        top.addWidget(self.btn_play)
-        top.addWidget(self.btn_stop)
-
-        layout = QVBoxLayout()
-        layout.addLayout(top)
-        layout.addWidget(self.label)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+        self.setCentralWidget(self.label)
+        self.build_menu()
 
         # Variables
         self.path1 = ""
@@ -122,17 +107,34 @@ class MainWindow(QMainWindow):
         self.decoder2 = None
         self.mixer = None
 
+    def build_menu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        action_video1 = QAction("Video 1 (Odd)", self)
+        action_video2 = QAction("Video 2 (Even)", self)
+        action_video1.triggered.connect(self.select_video1)
+        action_video2.triggered.connect(self.select_video2)
+        file_menu.addAction(action_video1)
+        file_menu.addAction(action_video2)
+
+        play_menu = menubar.addMenu("Play")
+        action_play = QAction("Play", self)
+        action_stop = QAction("Stop", self)
+        action_play.triggered.connect(self.start_mixing)
+        action_stop.triggered.connect(self.stop_all)
+        play_menu.addAction(action_play)
+        play_menu.addAction(action_stop)
+
+
     def select_video1(self):
         path, _ = QFileDialog.getOpenFileName(self, "Video 1 (Odd Columns)")
         if path:
             self.path1 = path
-            self.btn1.setText(f"🎞 1: {path.split('/')[-1]}")
 
     def select_video2(self):
         path, _ = QFileDialog.getOpenFileName(self, "Video 2 (Even Columns)")
         if path:
             self.path2 = path
-            self.btn2.setText(f"🎞 2: {path.split('/')[-1]}")
 
     def start_mixing(self):
         if not self.path1 or not self.path2:
@@ -143,9 +145,11 @@ class MainWindow(QMainWindow):
 
         # Decoder threads
         self.decoder1 = VideoDecoder(self.path1)
+        self.decoder1.setParent(self)
         self.decoder2 = VideoDecoder(self.path2)
-        self.decoder1.frame_ready.connect(lambda f: self.q1.put(f))
-        self.decoder2.frame_ready.connect(lambda f: self.q2.put(f))
+        self.decoder2.setParent(self)
+        self.decoder1.frame_ready.connect(lambda f: self.safe_put(self.q1, f))
+        self.decoder2.frame_ready.connect(lambda f: self.safe_put(self.q2, f))
         self.decoder1.start()
         self.decoder2.start()
 
@@ -154,26 +158,54 @@ class MainWindow(QMainWindow):
         self.mixer.mixed_frame_ready.connect(self.update_display)
         self.mixer.start()
 
+    def safe_put(self, q: Queue, f: np.ndarray):
+        try:
+            q.put_nowait(f)
+        except Full:
+            pass # Frame pass
+
     def stop_all(self):
         if self.decoder1:
             self.decoder1.stop()
+            self.decoder1.deleteLater()
             self.decoder1 = None
         if self.decoder2:
             self.decoder2.stop()
+            self.decoder2.deleteLater()
             self.decoder2 = None
         if self.mixer:
             self.mixer.stop()
             self.mixer = None
+        
+    def toggle_fullscreen(self):
+        if self.isFullScreen() == True :
+            self.showNormal()
+            self.menuBar().show()
+        else:
+            self.showFullScreen()
+            self.menuBar().hide()
 
     def update_display(self, qimg: QImage):
         pix = QPixmap.fromImage(qimg).scaled(
             self.label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
         self.label.setPixmap(pix)
+        
 
     def closeEvent(self, event):
         self.stop_all()
         event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.toggle_fullscreen()
+        if event.key() == Qt.Key.Key_1:
+            self.select_video1()
+        if event.key() == Qt.Key.Key_2:
+            self.select_video2()
+        if event.key() == Qt.Key.Key_3:
+            self.start_mixing()
+
 
 # ────────────────────────────────────────
 # Entry Point
